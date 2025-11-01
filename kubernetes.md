@@ -201,7 +201,7 @@ Each network interface device must have a unique MAC address within the network,
 
  wifi uses the amplitude and phase of an electromagnetic (radio) wave to transmit bits in the air. 
 
- n general, to stop each devices waves getting muddled with other devices, at a given moment in time only a single device can transmit or receive data to an access point. This means that devices take turns speaking to their access point
+ in general, to stop each devices waves getting muddled with other devices, at a given moment in time only a single device can transmit or receive data to an access point. This means that devices take turns speaking to their access point
 
 
  Unicast: used when a single recipient of a frame is the intended destination
@@ -754,3 +754,543 @@ helm->Kubernetes package manager (like apt/npm for K8s)
 Argo ->CD	GitOps continuous delivery for Kubernetes.
 
 Terraform -> Can act as a client using Kubernetes provider.
+
+### Containers Are Just Processes
+A container is not a VM — it doesn’t run its own kernel.
+It’s simply a regular Linux process running on the host kernel.
+What makes it look isolated is a combination of namespaces, cgroups, and filesystem tricks.
+
+### Namespaces (Isolation)
+Linux namespaces make a process believe it has its own world:
+- PID namespace → Process IDs are isolated. PID 1 in a container is just another process on the host.
+- Network namespace → Each container can have its own interfaces, IP addresses, routing tables.
+- Mount namespace → Each container can have its own filesystem view (rootfs).
+- UTS namespace → Lets a container have its own hostname.
+- IPC namespace → Isolates shared memory, semaphores, message queues.
+- User namespace → UID/GID mapping (container root ≠ host root).
+Together, these make the process think it’s running on its own machine
+
+### Networking
+By default:
+- Each container gets a virtual ethernet interface inside its network namespace.
+- The host connects it to a bridge (like docker0).
+- The bridge NATs traffic out via the host’s interface.
+- Inside that namespace, the container sees:
+  - Its own eth0 interface
+  - Its own IP addresses
+  - Its own routing table
+
+### veth Pairs (Virtual Ethernet Cables)
+- Linux creates `veth pairs` (virtual Ethernet interfaces).
+- One end goes inside the container (as `eth0`).
+- The other end stays on the host
+- Docker enslaves (ip link set vethabc123 master docker0) it to the docker0 bridge.
+
+### The Bridge (Default: docker0)
+- The bridge typically has an IP (e.g., 172.17.0.1) and does NAT for outbound Internet access.
+- This is why containers can reach each other (via the bridge) and the outside world (via NAT).
+
+#### Outbound Internet Access
+- Container sends packet → out eth0 → through veth → to bridge → out host NIC (eth0).
+- Host uses iptables `NAT (MASQUERADE)` so the packet looks like it’s from the host’s IP.
+Reply comes back → host de-NATs → delivers to container.
+#### Inbound Traffic (Port Mapping)
+- By default, containers are not exposed externally.
+- Docker uses `DNAT` rules to map host ports to container ports:
+Example: docker run -p 8080:80 nginx
+Traffic to host:8080 → DNAT → container:80.
+### Container Runtime
+- runc (standard runtime) → actually spawns the container process with namespaces & cgroups.
+- containerd / dockerd → manage lifecycle, images, volumes, networking.
+- Kubernetes (kubelet) → orchestrates containers across many machines.
+
+### Kubernetes Networking Model
+- Every Pod gets its own IP.
+- Flat network: any Pod can reach any other Pod (no NAT).
+- CNI plugins (Container Network Interface) implement this:
+  - Flannel (VXLAN overlay)
+  - Calico (BGP routing or VXLAN)
+  - Cilium (eBPF)
+So Kubernetes hides the complexity behind the CNI layer, but under the hood it’s still veth pairs, bridges, routes, and sometimes VXLAN tunnels.
+
+
+### How Frames Are Forwarded
+- When an Ethernet frame enters the bridge, the kernel looks at the destination MAC address.
+The bridge maintains a forwarding database (FDB), mapping:
+MAC → port
+- Rules:
+ - If MAC is known → forward to correct port.
+ - If unknown → flood to all ports (like a real switch).
+ - If broadcast (FF:FF:FF:FF:FF:FF) → flood to all ports.
+
+### IP Addressing on the Bridge
+- The bridge itself can have an IP (e.g. 172.17.0.1/16).
+- This IP acts like the default gateway for all containers.
+- Containers get IPs (e.g. 172.17.0.2, 172.17.0.3) on that subnet.
+- Packets destined outside go to the bridge, then NAT’ed out via host NIC.
+
+### NAT for Internet Access
+By default, Docker sets up an iptables MASQUERADE rule:
+
+```sh
+iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+```
+- This rewrites container source IPs to the host’s IP for Internet access.
+- Reply packets come back to the host, de-NATed, and delivered to the container.
+
+### Default Gateway for Containers
+- Docker assigns the bridge an IP (e.g. 172.17.0.1/16).
+- Containers connected to the bridge get IPs in the same subnet (172.17.0.2, 172.17.0.3).
+- Containers use the bridge’s IP as their default gateway.
+Example: Container sends traffic to 8.8.8.8 → hits bridge at 172.17.0.1 → routed/NAT’ed out host’s real NIC.
+- The bridge (docker0) = Layer 2 switch.
+- The IP assigned to docker0 = Host’s interface on that subnet.
+- This makes the host act like a default gateway/router for containers.
+### Host ↔ Container Communication
+- Without an IP, the host could switch packets between containers, but the host itself couldn’t talk to them.
+- With an IP, the host can `ping 172.17.0.2` or accept traffic from containers.
+- This IP lets the host itself participate in the containers’ subnet.
+
+
+### NAT and Routing
+- The bridge IP is where Docker’s iptables MASQUERADE rules hook in.
+- Packets from containers get source-NATed to the host’s IP before leaving.
+
+
+When Docker creates a container:
+- It assigns an IP (e.g. 172.17.0.2/16) to the container’s eth0.
+- It writes a default route in the container:
+`ip route add default via 172.17.0.1`
+- This points all “non-local” traffic to 172.17.0.1 (the bridge IP).
+So every container knows:
+`“If I need to reach the Internet or another subnet, send packets to 172.17.0.1.”`
+
+```sh
+default via 172.17.0.1 dev eth0
+172.17.0.0/16 dev eth0  proto kernel  scope link  src 172.17.0.2
+```
+
+- Anything within 172.17.0.0/16 → direct (bridge forwards).
+- Anything else (0.0.0.0/0) → send to 172.17.0.1 (the bridge IP = host gateway).
+
+### is it bridge that responds to arp or host?
+- It’s the host kernel that responds, not the bridge itself.
+- The bridge (docker0) is just a Layer-2 switch, it doesn’t have an IP stack of its own.
+- But when you assign an IP (`172.17.0.1/16`) to the bridge interface, the Linux kernel treats that IP as `a host IP reachable via that bridge.`
+So the host network stack responds to ARP requests for 172.17.0.1.
+
+
+`172.17.0.1 is at MAC 02:42:ac:11:00:01`
+That MAC belongs to the docker0 bridge interface (Linux gives it a virtual MAC).
+
+`In Linux, the kernel’s IP stack responds to ARP queries for any IP address that is assigned to one of its interfaces`
+- for container IPs (e.g. 172.17.0.2), it’s the container’s own kernel namespace responding to ARP,
+
+
+#### Packets Arrive at an Interface
+- A network interface (physical NIC like eth0, or virtual like vethXYZ) receives Ethernet frames from the wire.
+- The interface passes these frames up into the kernel networking stack.
+- At this point, the kernel examines them and decides what to do.
+
+
+### Kernel Processing Path
+When the kernel receives a frame, it does checks in layers:
+L2 (Ethernet layer)
+- If the destination MAC matches:
+ - The NIC’s own MAC address, OR
+ - A broadcast MAC (FF:FF:FF:FF:FF:FF), OR
+ - A multicast MAC that the interface has joined
+→ The frame is accepted into the kernel.
+- Otherwise → NIC may drop it (if not in promiscuous mode).
+
+### L3 (IP layer)
+- Kernel checks if the destination IP belongs to the system (any IP assigned to any interface).
+- If yes → kernel accepts for local delivery.
+- If no, but IP forwarding is enabled (net.ipv4.ip_forward=1) → kernel forwards the packet (routing decision).
+- If neither → kernel drops the packet.
+
+### L4 (Transport layer)
+- If destined for the host: kernel checks ports (TCP/UDP/ICMP).
+- If a socket is listening → deliver to that socket.
+- If nothing is listening → send ICMP error (e.g., "Port unreachable").
+
+### Important Detail: Promiscuous Mode
+- Normally NICs drop frames not destined for their MAC.
+- In promiscuous mode (e.g., with tcpdump, bridges, or containers), NICs pass all frames to the kernel, which then filters them.
+- This is how Linux bridges can forward frames not addressed to the host itself.
+
+### is it possible that a Mac address matches but ip doesn't belong to host?
+
+- If IP forwarding is disabled (default on Linux desktops/servers)
+- If IP forwarding is enabled (host acting as a router)
+- Special Case: Proxy ARP
+
+
+## IP Routing Tables
+- Purpose: Decide where packets should go.
+- Operates at Layer 3 (IP layer).
+- Controlled with ip route (or old route).
+
+`ip route add 10.1.0.0/24 via 192.168.1.1`
+
+- Packets destined for `10.1.0.0/24` → forward to next hop `192.168.1.1`
+
+- `The routing table never blocks traffic. It only picks the outgoing interface and next hop.`
+
+### iptables (Netfilter Firewall)
+- Purpose: Decide what to do with packets (allow, drop, NAT, mangle).
+- Operates at multiple layers (L3/L4).
+- Controlled with iptables (or modern nftables).
+
+`iptables -A INPUT -s 10.1.0.0/24 -j DROP`
+- Drop all packets from `10.1.0.0/24 `destined for this host.
+`iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE`
+- Rewrite source IP of outgoing packets to host’s IP (NAT).
+
+
+
+Assigning an IP address to a network bridge device (especially in a host operating system like Linux) is necessary primarily for the host machine to communicate on the bridged network segment with the other devices connected to that bridge. the IP address is needed for Layer 3 (Network Layer) communication for the host itself, which is managing the bridge
+
+
+```sh
+humans/tools ── kubectl/Helm/Argo →  API server  ← controllers/scheduler/kubelet/kube-proxy/CoreDNS
+                                              │
+                                              └─ etcd (storage)
+node-local: kubelet ↔ containerd/CRI, CNI datapath, CSI node plugins (no direct API access)
+
+```
+
+```sh
+minikube status
+minikube
+type: Control Plane
+host: Running
+kubelet: Running
+apiserver: Running
+kubeconfig: Configured
+```
+minikube dashboard
+Launch the Kubernetes dashboard in your browser
+
+```sh
+minikube addons list
+┌─────────────────────────────┬──────────┬────────────┬────────────────────────────────────────┐
+│         ADDON NAME          │ PROFILE  │   STATUS   │               MAINTAINER               │
+├─────────────────────────────┼──────────┼────────────┼────────────────────────────────────────┤
+│ ambassador                  │ minikube │ disabled   │ 3rd party (Ambassador)                 │
+│ amd-gpu-device-plugin       │ minikube │ disabled   │ 3rd party (AMD)                        │
+│ auto-pause                  │ minikube │ disabled   │ minikube                               │
+│ cloud-spanner               │ minikube │ disabled   │ Google                                 │
+│ csi-hostpath-driver         │ minikube │ disabled   │ Kubernetes                             │
+│ dashboard                   │ minikube │ disabled   │ Kubernetes                             │
+│ default-storageclass        │ minikube │ enabled ✅ │ Kubernetes                             │
+│ efk                         │ minikube │ disabled   │ 3rd party (Elastic)                    │
+│ freshpod                    │ minikube │ disabled   │ Google                                 │
+│ gcp-auth                    │ minikube │ disabled   │ Google                                 │
+│ gvisor                      │ minikube │ disabled   │ minikube                               │
+│ headlamp                    │ minikube │ disabled   │ 3rd party (kinvolk.io)                 │
+│ inaccel                     │ minikube │ disabled   │ 3rd party (InAccel [info@inaccel.com]) │
+│ ingress                     │ minikube │ disabled   │ Kubernetes                             │
+│ ingress-dns                 │ minikube │ disabled   │ minikube                               │
+│ inspektor-gadget            │ minikube │ disabled   │ 3rd party (inspektor-gadget.io)        │
+│ istio                       │ minikube │ disabled   │ 3rd party (Istio)                      │
+│ istio-provisioner           │ minikube │ disabled   │ 3rd party (Istio)                      │
+│ kong                        │ minikube │ disabled   │ 3rd party (Kong HQ)                    │
+│ kubeflow                    │ minikube │ disabled   │ 3rd party                              │
+│ kubetail                    │ minikube │ disabled   │ 3rd party (kubetail.com)               │
+│ kubevirt                    │ minikube │ disabled   │ 3rd party (KubeVirt)                   │
+│ logviewer                   │ minikube │ disabled   │ 3rd party (unknown)                    │
+│ metallb                     │ minikube │ disabled   │ 3rd party (MetalLB)                    │
+│ metrics-server              │ minikube │ disabled   │ Kubernetes                             │
+│ nvidia-device-plugin        │ minikube │ disabled   │ 3rd party (NVIDIA)                     │
+│ nvidia-driver-installer     │ minikube │ disabled   │ 3rd party (NVIDIA)                     │
+│ nvidia-gpu-device-plugin    │ minikube │ disabled   │ 3rd party (NVIDIA)                     │
+│ olm                         │ minikube │ disabled   │ 3rd party (Operator Framework)         │
+│ pod-security-policy         │ minikube │ disabled   │ 3rd party (unknown)                    │
+│ portainer                   │ minikube │ disabled   │ 3rd party (Portainer.io)               │
+│ registry                    │ minikube │ disabled   │ minikube                               │
+│ registry-aliases            │ minikube │ disabled   │ 3rd party (unknown)                    │
+│ registry-creds              │ minikube │ disabled   │ 3rd party (UPMC Enterprises)           │
+│ storage-provisioner         │ minikube │ enabled ✅ │ minikube                               │
+│ storage-provisioner-gluster │ minikube │ disabled   │ 3rd party (Gluster)                    │
+│ storage-provisioner-rancher │ minikube │ disabled   │ 3rd party (Rancher)                    │
+│ volcano                     │ minikube │ disabled   │ third-party (volcano)                  │
+│ volumesnapshots             │ minikube │ disabled   │ Kubernetes                             │
+│ yakd                        │ minikube │ disabled   │ 3rd party (marcnuri.com)               │
+└─────────────────────────────┴──────────┴────────────┴─────────────────────────────────────
+```
+
+`│ ingress                     │ minikube │ disabled   │ Kubernetes`
+
+`minikube addons enable ingress` //Enable the NGINX Ingress controller
+```
+ingress is an addon maintained by Kubernetes. For any concerns contact minikube on GitHub.
+You can view the list of minikube maintainers at: https://github.com/kubernetes/minikube/blob/master/OWNERS
+💡  After the addon is enabled, please run "minikube tunnel" and your ingress resources would be available at "127.0.0.1"
+```
+
+```sh
+minikube provisions and manages local Kubernetes clusters optimized for
+development workflows.
+
+Basic Commands:
+  start            Starts a local Kubernetes cluster
+  status           Gets the status of a local Kubernetes cluster
+  stop             Stops a running local Kubernetes cluster
+  delete           Deletes a local Kubernetes cluster
+  dashboard        Access the Kubernetes dashboard running within the minikube
+cluster
+  pause            pause Kubernetes
+  unpause          unpause Kubernetes
+
+Images Commands:
+  docker-env       Provides instructions to point your terminal's docker-cli to
+the Docker Engine inside minikube. (Useful for building docker images directly
+inside minikube)
+  podman-env       Configure environment to use minikube's Podman service
+  cache            Manage cache for images
+  image            Manage images
+
+Configuration and Management Commands:
+  addons           Enable or disable a minikube addon
+  config           Modify persistent configuration values
+  profile          Get or list the current profiles (clusters)
+  update-context   Update kubeconfig in case of an IP or port change
+
+Networking and Connectivity Commands:
+  service          Returns a URL to connect to a service
+  tunnel           Connect to LoadBalancer services
+
+Advanced Commands:
+  mount            Mounts the specified directory into minikube
+  ssh              Log into the minikube environment (for debugging)
+  kubectl          Run a kubectl binary matching the cluster version
+  node             Add, remove, or list additional nodes
+  cp               Copy the specified file into minikube
+
+Troubleshooting Commands:
+  ssh-key          Retrieve the ssh identity key path of the specified node
+  ssh-host         Retrieve the ssh host key of the specified node
+  ip               Retrieves the IP address of the specified node
+  logs             Returns logs to debug a local Kubernetes cluster
+  update-check     Print current and latest version number
+  version          Print the version of minikube
+  options          Show a list of global command-line options (applies to all
+commands).
+
+```
+
+```minikube ssh
+docker@minikube:~$ ip route
+default via 192.168.49.1 dev eth0 
+10.244.0.0/16 dev bridge proto kernel scope link src 10.244.0.1 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+192.168.49.0/24 dev eth0 proto kernel scope link src 192.168.49.2 
+```
+
+```sh
+kubectl 
+kubectl controls the Kubernetes cluster manager.
+
+ Find more information at: https://kubernetes.io/docs/reference/kubectl/
+
+Basic Commands (Beginner):
+  create          Create a resource from a file or from stdin
+  expose          Take a replication controller, service, deployment or pod and
+expose it as a new Kubernetes service
+  run             Run a particular image on the cluster
+  set             Set specific features on objects
+
+Basic Commands (Intermediate):
+  explain         Get documentation for a resource
+  get             Display one or many resources
+  edit            Edit a resource on the server
+  delete          Delete resources by file names, stdin, resources and names, or by resources and label selector
+
+Deploy Commands:
+  rollout         Manage the rollout of a resource
+  scale           Set a new size for a deployment, replica set, or replication
+controller
+  autoscale       Auto-scale a deployment, replica set, stateful set, or replication controller
+
+Cluster Management Commands:
+  certificate     Modify certificate resources
+  cluster-info    Display cluster information
+  top             Display resource (CPU/memory) usage
+  cordon          Mark node as unschedulable
+  uncordon        Mark node as schedulable
+  drain           Drain node in preparation for maintenance
+  taint           Update the taints on one or more nodes
+
+Troubleshooting and Debugging Commands:
+  describe        Show details of a specific resource or group of resources
+  logs            Print the logs for a container in a pod
+  attach          Attach to a running container
+  exec            Execute a command in a container
+  port-forward    Forward one or more local ports to a pod
+  proxy           Run a proxy to the Kubernetes API server
+  cp              Copy files and directories to and from containers
+  auth            Inspect authorization
+  debug           Create debugging sessions for troubleshooting workloads and
+nodes
+  events          List events
+
+Advanced Commands:
+  diff            Diff the live version against a would-be applied version
+  apply           Apply a configuration to a resource by file name or stdin
+  patch           Update fields of a resource
+  replace         Replace a resource by file name or stdin
+  wait            Experimental: Wait for a specific condition on one or many
+resources
+  kustomize       Build a kustomization target from a directory or URL
+
+```
+### Why minikube tunnel?
+Because on your laptop there’s no cloud load balancer to hand you a real public IP.
+When you enable the Ingress addon, the NGINX controller is exposed via a Service of type `LoadBalancer`. In the cloud, a provider (GKE/EKS/AKS) would provision a load balancer and assign an external IP. Locally, that would sit in `<pending>` forever.
+`minikube tunnel:`
+- Allocates an IP on your machine and updates EXTERNAL-IP for LoadBalancer services (including the ingress controller).
+- Adds a route on your host so traffic to that IP is forwarded into the Minikube cluster.
+
+
+## Alternatives (if you don’t want to run the tunnel)
+Pick one of these:
+### Port-forward the ingress controller
+`kubectl -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80`
+```curl
+curl -H "Host: hello.127.0.0.1.nip.io" http://localhost:8080/
+```
+### Hit your app directly via Service (bypass Ingress)
+`kubectl port-forward -n demo svc/http-echo 8080:80`
+`curl http://localhost:8080/`
+or
+`minikube service http-echo -n demo --url`
+
+### Use NodePort on the ingress controller (if it’s NodePort in your setup)
+`kubectl -n ingress-nginx get svc` //find the nodePort for HTTP (e.g., 30080)
+`curl -H "Host: hello.$(minikube ip).nip.io" "http://$(minikube ip):30080/"`
+
+```sh
+kubectl -n ingress-nginx get svc
+NAME                                 TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             NodePort    10.96.96.244    <none>        80:30445/TCP,443:30305/TCP   20m
+ingress-nginx-controller-admission   ClusterIP   10.96.141.188   <none>        443/TCP                      20m
+
+```
+
+`Tunnel only helps when the service type is LoadBalancer.`
+
+
+in a cloud cluster the external LoadBalancer typically fronts the ingress controller Service, and in Minikube the minikube tunnel emulates that missing load balancer on your laptop.
+But note: the tunnel isn’t only for ingress; it works for any Service of type LoadBalancer
+
+```sh
+#Cloud path
+Client → Cloud LB (public IP:80/443)
+      → Service/LoadBalancer (ingress controller)
+      → ingress-nginx pods
+      → your backend Services/Pods
+
+```
+
+```sh
+#Minikube path with tunnel
+Client → “External IP” created by `minikube tunnel` on your host (80/443)
+      → forwards to Service/LoadBalancer (ingress controller)
+      → ingress-nginx pods
+      → backends
+
+```
+
+assigns a real-looking EXTERNAL-IP to type: LoadBalancer Services,
+sets up host routes/NAT so traffic to that IP reaches the cluster.
+
+
+`a Linux bridge is a Layer 2 (Ethernet) switch implemented in software.`But the Bridge Device Is Also a Host Interface
+
+When you create a bridge (`br0`, `docker0`), the kernel creates a network interface called `br0`.
+That interface:
+- Has a MAC address.
+- Can have an IP address assigned.
+- Can send and receive L3 (IP) traffic for the host
+- The bridge interface (the br0 device) = the host’s own port into that L2 domain.
+
+
+- If you don’t assign an IP, the bridge acts purely as an L2 switch — it only forwards frames.
+- If you do assign an IP, the host’s kernel can also communicate on that subnet.
+- This is why Docker assigns `172.17.0.1` to `docker0`: it turns the host into a gateway on that virtual LAN.
+
+the interface has an IP address because it represents the host OS connection to this bridge … it doesn’t need an IP address for bridging to work — the IP address is strictly for allowing the host itself participate in the network.
+
+An interface that is a member of a bridge cannot have IPs assigned to it. You assign an address to the bridge interface instead
+
+- When you add a port to a bridge:
+`ip link set eth0 master br0`
+- That interface (`eth0`) becomes enslaved to the bridge.
+- The bridge takes over the job of sending/receiving Ethernet frames on its behalf.
+- If eth0 had an IP, it’s removed — because that IP would conflict with the bridge’s L3 function.
+- Now, eth0 is just a Layer 2 port — no longer a full network interface for the IP stack
+
+[introduction-linux-bridging-](https://developers.redhat.com/articles/2022/04/06/introduction-linux-bridging-commands-and-features?utm_source=chatgpt.com#)
+
+Bitwise AND
+Every IPv4 address and subnet mask is really just a 32-bit binary number.
+When we “AND” them together, we keep the network portion and zero out the host portion.
+
+/25 Network (Mask = 255.255.255.128)
+That means:
+First 25 bits = Network part
+Last 7 bits = Host part
+
+The 25th bit flipped from 0 → 1.
+That’s the exact moment we crossed into another network
+
+Any IP with that bit = 0 → first subnet (192.168.123.0/25)
+Any IP with that bit = 1 → second subnet (192.168.123.128/25)
+
+/26 uses the first 2 bits of the last octet as network bits, then 6 host bits:
+```sh
+Subnet 1 (.0/26)   :  xx = 00 →  0 0 xxxxxx  =>  0  -  63
+Subnet 2 (.64/26)  :  xx = 01 →  0 1 xxxxxx  => 64  - 127
+Subnet 3 (.128/26) :  xx = 10 →  1 0 xxxxxx  =>128  - 191
+Subnet 4 (.192/26) :  xx = 11 →  1 1 xxxxxx  =>192  - 255
+```
+
+The pair of MSBs in the last octet (00, 01, 10, 11) selects which /26 you’re in.
+
+The mask `11000000` defines that the first two bits in the last octet are fixed for the network.
+When those bits change — from 00 → 01 → 10 → 11 — you’ve crossed into a new subnet.
+```sh
+# /26 (mask = 255.255.255.192 = 11111111.11111111.11111111.11000000
+| Bits     | Decimal | Subnet             |
+| -------- | ------- | ------------------ |
+| 00xxxxxx | 0–63    | 192.168.123.0/26   |
+| 01xxxxxx | 64–127  | 192.168.123.64/26  |
+| 10xxxxxx | 128–191 | 192.168.123.128/26 |
+| 11xxxxxx | 192–255 | 192.168.123.192/26 |
+```
+
+“Fixed” — Within a Single Subnet
+When we say “the first two bits are fixed for the network”, we mean:
+Inside one subnet, those two bits never vary — they stay the same for every host in that subnet.
+Example for /26 (mask = 255.255.255.192 = 11111111.11111111.11111111.11000000):
+IP Address	Binary (last octet)	First 2 bits (network)	Host bits	Subnet
+```sh
+192.168.123.1	00000001	00	000001	subnet #1
+192.168.123.30	00011110	00	011110	subnet #1
+192.168.123.60	00111100	00	111100	subnet #1
+```
+Here, for all hosts in the same subnet, those first two bits are fixed at 00.
+
+
+The subnet mask (for example /26 → 255.255.255.192) defines which bits belong to the network and which belong to the host
+
+`Within a single subnet, only host bits vary`
+
+Now the next subnet starts when the network bits increment:
+Network bits change: 00 → 01
+
+- Subnet mask    :Defines how many bits belong to the network vs. host. (Fixed per design.)                                          
+- Network bits  : Fixed within each subnet, but take on new values in different subnets.                                               
+- Host bits  : Change within the subnet to identify individual devices.                                                             
+- Crossing subnets : Happens when one of the network bits changes its value (because you’ve incremented past that subnet’s block size). 
